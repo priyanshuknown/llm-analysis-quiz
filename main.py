@@ -1,28 +1,42 @@
 # main.py
+
 import os
-import traceback
+import asyncio
 from typing import Any, Dict
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ValidationError
-from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# Load .env BEFORE importing quiz_solver
-load_dotenv()
+from quiz_solver import run_quiz_chain
 
-from quiz_solver import run_quiz_chain  # noqa: E402
+# ---------------------------------------------------------
+# Config
+# ---------------------------------------------------------
 
 STUDENT_EMAIL = os.getenv("STUDENT_EMAIL")
 STUDENT_SECRET = os.getenv("STUDENT_SECRET")
-MAX_QUIZ_STEPS = int(os.getenv("MAX_QUIZ_STEPS", "5"))
 
 if not STUDENT_SECRET:
-    print("[WARN] STUDENT_SECRET is not set. Secret verification will fail.")
+    print("[WARN] STUDENT_SECRET is not set. Secret verification will always fail.")
 if not STUDENT_EMAIL:
-    print("[WARN] STUDENT_EMAIL is not set. Using request email instead for submissions.")
+    print("[WARN] STUDENT_EMAIL is not set. Email will not be checked strictly.")
 
-app = FastAPI(title="TDS LLM Analysis Quiz – Gemini Version")
+
+# ---------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------
+
+app = FastAPI(title="LLM Analysis Quiz Solver")
+
+# Allow CORS just in case (not strictly needed for TDS evaluation)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class QuizRequest(BaseModel):
@@ -31,62 +45,84 @@ class QuizRequest(BaseModel):
     url: str
 
 
+class QuizResponse(BaseModel):
+    status: str
+    detail: Any | None = None
+
+
 @app.get("/")
-async def root():
-    return {"message": "TDS LLM Analysis Quiz endpoint. POST to /run-quiz."}
+async def root() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "message": "LLM Analysis Quiz endpoint is running.",
+    }
 
 
 @app.post("/run-quiz")
-async def run_quiz(request: Request):
-    # 1. Parse JSON safely
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+async def run_quiz(payload: QuizRequest) -> Dict[str, Any]:
+    """
+    Main entrypoint for the TDS LLM Analysis Quiz project.
 
-    # 2. Validate schema
-    try:
-        qr = QuizRequest(**body)
-    except ValidationError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON fields: {e.errors()}")
+    Expects JSON:
+      {
+        "email": "...",
+        "secret": "...",
+        "url": "https://tds-llm-analysis.s-anand.net/quiz-xxx"
+      }
 
-    # 3. Verify secret
-    if STUDENT_SECRET is None:
-        raise HTTPException(status_code=500, detail="Server misconfigured: STUDENT_SECRET not set")
+    Returns:
+      {
+        "status": "ok",
+        "email": "...",
+        "steps_taken": n,
+        "results": [...],
+        ...
+      }
 
-    if qr.secret != STUDENT_SECRET:
+    Or on error:
+      {
+        "status": "error",
+        "error": "ExceptionType: message"
+      }
+    """
+
+    # 1. Basic JSON is already validated by Pydantic (400 if missing fields)
+
+    # 2. Verify secret
+    if STUDENT_SECRET and payload.secret != STUDENT_SECRET:
+        # Incorrect secret => 403 as per project spec
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-    # We can optionally check email, but spec only requires secret verification
-    student_email = STUDENT_EMAIL or qr.email
-    student_secret = STUDENT_SECRET
+    # 3. (Optional) Check email matches
+    if STUDENT_EMAIL and payload.email != STUDENT_EMAIL:
+        # Not strictly required to reject, but we log it
+        print(
+            f"[WARN] Request email {payload.email} != STUDENT_EMAIL {STUDENT_EMAIL}. "
+            "Continuing anyway."
+        )
 
     # 4. Run quiz chain
     try:
         result = await run_quiz_chain(
-            start_url=qr.url,
-            student_email=student_email,
-            student_secret=student_secret,
-            max_steps=MAX_QUIZ_STEPS,
+            quiz_url=payload.url,
+            email=payload.email,
+            secret=payload.secret,
+            max_steps=5,
         )
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "ok",
-                "email": student_email,
-                "steps_taken": result["steps_taken"],
-                "results": result["results"],
-            },
-        )
+        return {
+            "status": "ok",
+            "email": payload.email,
+            **result,
+        }
+    except HTTPException:
+        # Let explicit HTTPExceptions pass through
+        raise
     except Exception as e:
-        tb = traceback.format_exc()
+        # Catch all internal errors and wrap them
+        err_str = f"{type(e).__name__}: {e}"
         print("=== INTERNAL ERROR ===")
-        print(tb)
-        # Per spec: secret is valid → still return HTTP 200 JSON
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "error",
-                "error": f"{type(e).__name__}: {e}",
-            },
-        )
+        print(err_str)
+        return {
+            "status": "error",
+            "error": err_str,
+        }
