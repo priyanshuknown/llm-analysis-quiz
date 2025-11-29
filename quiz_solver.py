@@ -1,19 +1,122 @@
 # quiz_solver.py
+
 import asyncio
-import os
-import re
 import json
-import io
-import base64
+import re
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 import httpx
-import pandas as pd
-from urllib.parse import urljoin, urlparse
 
 from gemini_client import ask_llm_for_answer
 
-HTTP_TIMEOUT = 60  # seconds
+# Global HTTP client timeout (in seconds)
+HTTP_TIMEOUT = 60.0
+
+
+# ---------------------------------------------------------
+# 1. Fetch and parse quiz page
+# ---------------------------------------------------------
+
+async def fetch_quiz_page(url: str) -> Tuple[str, str, List[str]]:
+    """
+    Fetch the quiz page HTML and extract:
+      - raw HTML
+      - text content (including decoded atob(`...`) blocks)
+      - list of links (href URLs)
+    """
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as http_client:
+        resp = await http_client.get(url)
+        resp.raise_for_status()
+        html = resp.text
+
+    # Basic text extraction: strip tags roughly
+    page_text = strip_html_tags(html)
+
+    # Handle atob(`...`) JavaScript blocks that contain base64 text of the question
+    decoded_texts = extract_atob_blocks(html)
+    if decoded_texts:
+        page_text += "\n\n" + "\n\n".join(decoded_texts)
+
+    # Extract all links
+    links = extract_links(html)
+    # Also try to capture http/https URLs that appear as plain text
+    links.extend(extract_inline_urls(page_text))
+
+    # Deduplicate links
+    links = sorted(set(links))
+
+    return html, page_text, links
+
+
+def strip_html_tags(html: str) -> str:
+    """Very rough HTML → text conversion."""
+    # Remove script and style
+    html = re.sub(r"<script.*?</script>", "", html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r"<style.*?</style>", "", html, flags=re.DOTALL | re.IGNORECASE)
+
+    # Replace <br> and <p> with newlines
+    html = re.sub(r"<\s*br\s*/?>", "\n", html, flags=re.IGNORECASE)
+    html = re.sub(r"</p\s*>", "\n", html, flags=re.IGNORECASE)
+
+    # Remove remaining tags
+    text = re.sub(r"<[^>]+>", "", html)
+    # Unescape common entities
+    text = text.replace("&nbsp;", " ").replace("&amp;", "&")
+    text = text.replace("&lt;", "<").replace("&gt;", ">")
+    return text
+
+
+def extract_links(html: str) -> List[str]:
+    """Extract href links from <a href="..."> tags."""
+    links: List[str] = []
+    for m in re.finditer(r'href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE):
+        links.append(m.group(1))
+    return links
+
+
+def extract_inline_urls(text: str) -> List[str]:
+    """Extract http/https URLs that appear as plain text in the page."""
+    urls: List[str] = []
+    for m in re.finditer(r"https?://[^\s\"'<>]+", text):
+        urls.append(m.group(0))
+    return urls
+
+
+def extract_atob_blocks(html: str) -> List[str]:
+    """
+    Look for JS blocks like:
+      atob(`...base64...`)
+    Decode them as UTF-8 and return the decoded strings.
+    """
+    decoded: List[str] = []
+    for m in re.finditer(r"atob\(\s*`([^`]+)`\s*\)", html):
+        b64 = m.group(1).strip()
+        try:
+            import base64
+
+            data = base64.b64decode(b64)
+            decoded_text = data.decode("utf-8", errors="replace")
+            decoded.append(decoded_text)
+        except Exception:
+            # Ignore malformed base64
+            continue
+    return decoded
+
+
+# ---------------------------------------------------------
+# 2. Extract quiz instructions and submit / payload info
+# ---------------------------------------------------------
+
+def extract_quiz_instructions(page_text: str) -> str:
+    """
+    For now, use the entire page text as instructions.
+
+    You could get fancier (e.g., look for lines starting with 'Qxxx.'), but this
+    is usually enough for the LLM to understand the question.
+    """
+    return page_text.strip()
+
 
 def extract_submission_template(page_text: str) -> Optional[Dict[str, Any]]:
     """
@@ -34,14 +137,12 @@ def extract_submission_template(page_text: str) -> Optional[Dict[str, Any]]:
 
     We'll:
       - find a '{ ... }' block that mentions "email" and "secret"
-      - strip JS-style comments
+      - strip // comments
       - parse as JSON
     """
     if not page_text:
         return None
 
-    # Find a candidate JSON block that contains "email" and "secret"
-    # This is a bit loose but works for these quiz pages.
     match = re.search(
         r"\{[^{}]*\"email\"[^{}]*\"secret\"[^{}]*\}",
         page_text,
@@ -52,16 +153,15 @@ def extract_submission_template(page_text: str) -> Optional[Dict[str, Any]]:
 
     raw_block = match.group(0)
 
-    # Remove JS-style comments: // ...
-    cleaned_lines = []
+    # Remove // comments
+    cleaned_lines: List[str] = []
     for line in raw_block.splitlines():
-        # drop everything after //
         line = line.split("//", 1)[0]
         if line.strip():
             cleaned_lines.append(line)
     cleaned = "\n".join(cleaned_lines)
 
-    # Sometimes trailing commas can break JSON. Try to fix a few common cases.
+    # Remove trailing commas before '}' or ']'
     cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
 
     try:
@@ -74,97 +174,6 @@ def extract_submission_template(page_text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def fetch_quiz_page(url: str) -> Tuple[str, str, List[str]]:
-    """
-    Fetch the quiz page using plain HTTP (no JS execution).
-    Additionally:
-    - Detect any atob(`...`) or atob("...") calls in <script> tags.
-    - Base64-decode those strings to reconstruct the rendered HTML/text.
-    - Return:
-        html          = original HTML
-        page_text     = plain text from HTML + decoded segments
-        links         = all href links from original HTML + decoded segments
-    """
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        html = r.text
-
-    # --- 1. Decode base64 segments from atob() calls ---
-
-    decoded_segments: List[str] = []
-
-    # Pattern: atob(`....`)
-    for m in re.finditer(r"atob\(\s*`([^`]+)`\s*\)", html, flags=re.DOTALL):
-        b64 = m.group(1).replace("\n", "").replace("\r", "")
-        try:
-            decoded = base64.b64decode(b64).decode("utf-8", errors="ignore")
-            decoded_segments.append(decoded)
-        except Exception:
-            continue
-
-    # Pattern: atob("....")
-    for m in re.finditer(r'atob\(\s*"([^"]+)"\s*\)', html, flags=re.DOTALL):
-        b64 = m.group(1).replace("\n", "").replace("\r", "")
-        try:
-            decoded = base64.b64decode(b64).decode("utf-8", errors="ignore")
-            decoded_segments.append(decoded)
-        except Exception:
-            continue
-
-    # --- 2. Plain-text extraction from original HTML (without scripts/styles) ---
-
-    no_script_html = re.sub(
-        r"<script.*?>.*?</script>",
-        " ",
-        html,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    no_style_html = re.sub(
-        r"<style.*?>.*?</style>",
-        " ",
-        no_script_html,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    plain_html_text = re.sub(r"<[^>]+>", " ", no_style_html)
-    plain_html_text = re.sub(r"\s+", " ", plain_html_text).strip()
-
-    # --- 3. Extract links from original HTML ---
-
-    raw_links = re.findall(r'href=["\']([^"\']+)["\']', html)
-    links = [urljoin(url, link) for link in raw_links]
-
-    # --- 4. Extract links from decoded segments (they usually contain <a href="...">) ---
-
-    for seg in decoded_segments:
-        for link in re.findall(r'href=["\']([^"\']+)["\']', seg):
-            links.append(urljoin(url, link))
-
-    # Deduplicate links
-    links = list(dict.fromkeys(links))
-
-    # --- 5. Combine plain HTML text with decoded segments as page_text ---
-
-    decoded_text = "\n\n".join(
-        re.sub(r"\s+", " ", seg).strip() for seg in decoded_segments
-    )
-
-    if decoded_text:
-        page_text = plain_html_text + "\n\n" + decoded_text
-    else:
-        page_text = plain_html_text
-
-    return html, page_text, links
-
-
-def extract_quiz_instructions(page_text: str) -> str:
-    """
-    For now, just return the full page_text.
-    Gemini will focus on the relevant question/instructions.
-    """
-    return page_text
-
-
 def find_submit_url(
     quiz_url: str,
     page_text: str,
@@ -173,12 +182,11 @@ def find_submit_url(
 ) -> Optional[str]:
     """
     Try to find the submit URL from:
-    - Text like: 'Post your answer to https://example.com/submit ...'
-    - Any absolute URL in text containing 'submit'
-    - Any relative '/submit...' in text or HTML
-    - Any href link containing 'submit'
+      - Text like: 'Post your answer to https://example.com/submit ...'
+      - Any absolute URL in text containing 'submit'
+      - Any relative '/submit...' in text or HTML
+      - Any href link containing 'submit'
     """
-    # Combine decoded text + raw HTML so we don't miss anything
     blob = (page_text or "") + "\n" + (html or "")
 
     # 1. Exact phrase: 'Post your answer to <url>'
@@ -208,86 +216,92 @@ def find_submit_url(
     if m:
         return urljoin(quiz_url, m.group(1).strip())
 
-    # 4. Fallback: any link we collected that contains 'submit'
+    # 4. Fallback: any href link we collected that contains 'submit'
     for link in links:
         if "submit" in link.lower():
-            return link
+            # Make relative URLs absolute
+            return urljoin(quiz_url, link)
 
     return None
 
 
-async def download_and_extract_file_text(url: str) -> Dict[str, Any]:
+# ---------------------------------------------------------
+# 3. Data file downloading / extraction
+# ---------------------------------------------------------
+
+async def download_and_extract_file_text(url: str) -> str:
     """
-    Download file and convert to text summary for the LLM.
+    Download a data file (CSV, JSON, TXT, PDF, etc) and return a text summary.
 
-    To avoid NotImplementedError / PDF issues, we **do not** try to parse PDFs.
-    - CSV → read with pandas
-    - JSON → pretty-print or raw text
-    - TXT/other → raw text
-    - PDF → just a placeholder message
-
-    This function must **never raise**; on any error it returns a short error message.
+    We do very lightweight parsing:
+      - CSV / TSV: load into text
+      - JSON: pretty-print
+      - TXT: raw text
+      - PDF: try to extract text with pypdf if available, else note it's a PDF
     """
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        content_type = r.headers.get("content-type", "")
-        raw = r.content
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as http_client:
+        resp = await http_client.get(url)
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "")
+        data = resp.content
 
-    text_snippet = ""
-    try:
-        lower_url = url.lower()
+    text_summary = ""
 
-        # CSV
-        if lower_url.endswith(".csv") or "text/csv" in content_type:
-            df = pd.read_csv(io.BytesIO(raw))
-            text_snippet = df.to_csv(index=False)
+    # Decide based on content type or file extension
+    lowered = content_type.lower()
+    if "text/csv" in lowered or url.lower().endswith(".csv"):
+        text_summary = data.decode("utf-8", errors="replace")
+    elif "application/json" in lowered or url.lower().endswith(".json"):
+        try:
+            obj = json.loads(data.decode("utf-8", errors="replace"))
+            text_summary = json.dumps(obj, indent=2)[:8000]
+        except Exception:
+            text_summary = data.decode("utf-8", errors="replace")
+    elif "text/plain" in lowered or url.lower().endswith(".txt"):
+        text_summary = data.decode("utf-8", errors="replace")
+    elif "pdf" in lowered or url.lower().endswith(".pdf"):
+        try:
+            from pypdf import PdfReader  # type: ignore
 
-        # JSON
-        elif lower_url.endswith(".json") or "application/json" in content_type:
-            try:
-                obj = json.loads(raw)
-                text_snippet = json.dumps(obj, indent=2)
-            except Exception:
-                text_snippet = raw.decode("utf-8", errors="ignore")
+            import io
 
-        # PDF → DO NOT PARSE, just mark it
-        elif lower_url.endswith(".pdf") or "application/pdf" in content_type:
-            text_snippet = "[PDF file linked here; PDF parsing disabled to avoid NotImplementedError.]"
+            reader = PdfReader(io.BytesIO(data))
+            chunks: List[str] = []
+            for page in reader.pages:
+                chunks.append(page.extract_text() or "")
+            text_summary = "\n".join(chunks)[:8000]
+        except Exception:
+            text_summary = "[PDF file; could not extract text reliably]"
+    else:
+        # Fallback: try decode as text
+        try:
+            text_summary = data.decode("utf-8", errors="replace")
+        except Exception:
+            text_summary = f"[Binary file of type {content_type}; length={len(data)}]"
 
-        # Generic text / others
-        else:
-            text_snippet = raw.decode("utf-8", errors="ignore")
-
-    except Exception as e:
-        text_snippet = f"[Error while parsing file: {type(e).__name__}]"
-
-    return {
-        "url": url,
-        "content_type": content_type,
-        "text_snippet": text_snippet,
-    }
+    return text_summary
 
 
-async def discover_data_files(links: List[str]) -> List[Dict[str, Any]]:
+def pick_data_file_links(
+    quiz_url: str,
+    page_text: str,
+    links: List[str],
+) -> List[str]:
     """
-    From all page links, pick those that look like data files (csv/json/pdf/txt)
-    and download them.
+    Choose which links look like data files worth downloading.
+    We'll pick ones that end with .csv, .json, .txt, .pdf, etc.
     """
-    data_links = [
-        link for link in links
-        if any(
-            link.lower().endswith(ext)
-            for ext in (".csv", ".json", ".txt", ".pdf")
-        )
-    ]
+    exts = (".csv", ".json", ".txt", ".tsv", ".pdf")
+    chosen: List[str] = []
+    for link in links:
+        if any(link.lower().endswith(ext) for ext in exts):
+            chosen.append(urljoin(quiz_url, link))
+    return sorted(set(chosen))
 
-    tasks = [download_and_extract_file_text(l) for l in data_links]
-    if not tasks:
-        return []
 
-    return await asyncio.gather(*tasks)
-
+# ---------------------------------------------------------
+# 4. Solve a single quiz page
+# ---------------------------------------------------------
 
 async def solve_single_quiz(
     quiz_url: str,
@@ -295,34 +309,50 @@ async def solve_single_quiz(
     student_secret: str,
 ) -> Dict[str, Any]:
     """
-    Solve one quiz URL:
-    - Render page (via HTTP + base64 decoding)
-    - Extract instructions & submit URL
-    - Download data files
-    - Ask Gemini for 'answer'
-    - Submit to quiz server
-    Returns dict with details, including any next URL.
+    Solve a single quiz page:
+      - Fetch quiz page
+      - Extract instructions and data files
+      - Ask LLM for 'answer'
+      - Submit answer to submit URL, follow next URL if provided
     """
-    from urllib.parse import urlparse, urljoin  # make sure this is imported at top
 
     html, page_text, links = await fetch_quiz_page(quiz_url)
     instructions = extract_quiz_instructions(page_text)
     submit_url = find_submit_url(quiz_url, page_text, links, html)
 
-# If we still couldn't find it, fall back to origin + "/submit"
+    # Fallback: if still missing, use origin + "/submit"
     if not submit_url:
         parsed = urlparse(quiz_url)
-        origin = f"{parsed.scheme}://{parsed.netloc}"
-        submit_url = urljoin(origin, "/submit")
-
-    # If even that fails somehow (no scheme/netloc), then give up
-        if not parsed.scheme or not parsed.netloc:
+        if parsed.scheme and parsed.netloc:
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            submit_url = urljoin(origin, "/submit")
+        else:
             raise RuntimeError(f"Could not find submit URL on quiz page: {quiz_url}")
 
+    # Figure out which data files to download
+    data_file_urls = pick_data_file_links(quiz_url, page_text, links)
+    data_files: List[Dict[str, Any]] = []
 
-    data_files = await discover_data_files(links)
+    for u in data_file_urls:
+        try:
+            text_summary = await download_and_extract_file_text(u)
+            data_files.append(
+                {
+                    "url": u,
+                    "content_type": "unknown",
+                    "text_snippet": text_summary[:8000],
+                }
+            )
+        except Exception as e:
+            data_files.append(
+                {
+                    "url": u,
+                    "content_type": "error",
+                    "text_snippet": f"Error downloading file: {e}",
+                }
+            )
 
-    # Ask Gemini for answer, using all context
+    # Ask LLM to compute the answer
     answer = await ask_llm_for_answer(
         quiz_url=quiz_url,
         page_text=page_text,
@@ -330,20 +360,15 @@ async def solve_single_quiz(
         data_files=data_files,
     )
 
-# Try to extract a JSON template from the quiz page
+    # Build submit payload (prefer using template from page)
     template = extract_submission_template(page_text)
-
     if template:
-    # Start from template and overwrite key fields
-        submit_payload = dict(template)  # shallow copy
-
-    # Overwrite with our real values
+        submit_payload: Dict[str, Any] = dict(template)
         submit_payload["email"] = student_email
         submit_payload["secret"] = student_secret
         submit_payload["url"] = quiz_url
         submit_payload["answer"] = answer
     else:
-    # Fallback to our generic payload if no template found
         submit_payload = {
             "email": student_email,
             "secret": student_secret,
@@ -351,53 +376,71 @@ async def solve_single_quiz(
             "answer": answer,
         }
 
-    submit_resp = await client.post(submit_url, json=submit_payload)
-    submit_resp.raise_for_status()
+    # Actually call the submit URL
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as http_client:
+        submit_resp = await http_client.post(submit_url, json=submit_payload)
+        # We want to see error messages, so let 4xx raise
+        submit_resp.raise_for_status()
+        try:
+            resp_json = submit_resp.json()
+        except Exception:
+            resp_json = {"raw": submit_resp.text}
 
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.post(submit_url, json=submit_payload)
-        resp.raise_for_status()
-        resp_json = resp.json()
-
-    # Next URL if any
-    next_url = resp_json.get("url")
     return {
         "quiz_url": quiz_url,
-        "submit_url": submit_url,
         "answer": answer,
+        "submit_url": submit_url,
+        "submit_payload": submit_payload,
         "submit_response": resp_json,
-        "next_url": next_url,
+        "next_url": resp_json.get("url"),
     }
 
 
+# ---------------------------------------------------------
+# 5. Loop over quiz chain
+# ---------------------------------------------------------
+
 async def run_quiz_chain(
-    start_url: str,
-    student_email: str,
-    student_secret: str,
+    quiz_url: str,
+    email: str,
+    secret: str,
     max_steps: int = 5,
 ) -> Dict[str, Any]:
     """
-    Repeatedly solve quizzes starting from start_url
-    until there's no new url or we hit max_steps.
+    Repeatedly solve quizzes starting from quiz_url, following
+    'next_url' in each submit response, up to max_steps.
     """
     results: List[Dict[str, Any]] = []
-    current_url = start_url
+    current_url: Optional[str] = quiz_url
 
-    for step in range(1, max_steps + 1):
-        step_result = await solve_single_quiz(
-            quiz_url=current_url,
-            student_email=student_email,
-            student_secret=student_secret,
-        )
-        results.append(step_result)
-
-        next_url = step_result.get("next_url")
-        if not next_url:
+    for step in range(max_steps):
+        if not current_url:
             break
-        current_url = next_url
+
+        try:
+            step_result = await solve_single_quiz(
+                quiz_url=current_url,
+                student_email=email,
+                student_secret=secret,
+            )
+        except Exception as e:
+            results.append(
+                {
+                    "quiz_url": current_url,
+                    "error": f"{type(e).__name__}: {e}",
+                }
+            )
+            break
+
+        results.append(step_result)
+        current_url = step_result.get("next_url")
+
+        # If no next URL, quiz is over
+        if not current_url:
+            break
 
     return {
-        "start_url": start_url,
+        "start_url": quiz_url,
         "steps_taken": len(results),
         "results": results,
     }
