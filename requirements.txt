@@ -1,5 +1,9 @@
 fastapi
 uvicorn[standard]
+httpx
 playwright
-requests
-openai>=1.0.0
+xai-sdk
+python-dotenv
+pydantic
+pypdf
+pandas
