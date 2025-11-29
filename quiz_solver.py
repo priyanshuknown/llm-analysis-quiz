@@ -107,24 +107,50 @@ def extract_quiz_instructions(page_text: str) -> str:
     return page_text
 
 
-def find_submit_url(page_text: str, links: List[str]) -> Optional[str]:
+def find_submit_url(
+    quiz_url: str,
+    page_text: str,
+    links: List[str],
+    html: str,
+) -> Optional[str]:
     """
     Try to find the submit URL from:
     - Text like: 'Post your answer to https://example.com/submit ...'
-    - Any URL in text containing 'submit'
+    - Any absolute URL in text containing 'submit'
+    - Any relative '/submit...' in text or HTML
     - Any href link containing 'submit'
     """
-    # 1. Exact pattern: 'Post your answer to <url>'
-    m = re.search(r"Post your answer to\s+(https?://[^\s\"'<>]+)", page_text, flags=re.IGNORECASE)
+    # Combine decoded text + raw HTML so we don't miss anything
+    blob = (page_text or "") + "\n" + (html or "")
+
+    # 1. Exact phrase: 'Post your answer to <url>'
+    m = re.search(
+        r"Post your answer to\s+(https?://[^\s\"'<>]+)",
+        blob,
+        flags=re.IGNORECASE,
+    )
     if m:
         return m.group(1).strip()
 
-    # 2. Any URL in the text that contains 'submit'
-    m = re.search(r"(https?://[^\s\"'<>]*submit[^\s\"'<>]*)", page_text, flags=re.IGNORECASE)
+    # 2. Any absolute URL containing 'submit'
+    m = re.search(
+        r"(https?://[^\s\"'<>]*submit[^\s\"'<>]*)",
+        blob,
+        flags=re.IGNORECASE,
+    )
     if m:
         return m.group(1).strip()
 
-    # 3. Fallback: any link from hrefs that contains 'submit'
+    # 3. Any relative '/submit...' pattern
+    m = re.search(
+        r"(/submit[^\s\"'<>]*)",
+        blob,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return urljoin(quiz_url, m.group(1).strip())
+
+    # 4. Fallback: any link we collected that contains 'submit'
     for link in links:
         if "submit" in link.lower():
             return link
@@ -221,7 +247,7 @@ async def solve_single_quiz(
     """
     html, page_text, links = await fetch_quiz_page(quiz_url)
     instructions = extract_quiz_instructions(page_text)
-    submit_url = find_submit_url(page_text, links)
+    submit_url = find_submit_url(quiz_url, page_text, links, html)
 
     if not submit_url:
         raise RuntimeError(f"Could not find submit URL on quiz page: {quiz_url}")
