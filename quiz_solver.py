@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import pandas as pd
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from gemini_client import ask_llm_for_answer
 
