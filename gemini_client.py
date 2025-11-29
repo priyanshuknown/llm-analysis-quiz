@@ -1,5 +1,3 @@
-# gemini_client.py
-
 import os
 import textwrap
 import json
@@ -8,24 +6,25 @@ from typing import Any, Dict, List
 import google.generativeai as genai
 import asyncio
 
-# Read API key from environment
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL")  # e.g. 'models/gemini-2.5-flash'
 
 if not GEMINI_API_KEY:
     print("[WARN] GEMINI_API_KEY is not set. Gemini calls will fail.")
     model = None
 else:
-    # Configure Gemini client
     genai.configure(api_key=GEMINI_API_KEY)
-
-    # Use a stable, widely supported model
-    MODEL_NAME = "gemini-pro"
-    try:
-        model = genai.GenerativeModel(MODEL_NAME)
-        print(f"[INFO] Using Gemini model: {MODEL_NAME}")
-    except Exception as e:
-        print(f"[ERROR] Could not initialize Gemini model '{MODEL_NAME}': {e}")
+    if not GEMINI_MODEL:
+        print("[ERROR] GEMINI_MODEL is not set. Set it to a valid model name from list_models().")
         model = None
+    else:
+        try:
+            model = genai.GenerativeModel(GEMINI_MODEL)
+            print(f"[INFO] Using Gemini model: {GEMINI_MODEL}")
+        except Exception as e:
+            print(f"[ERROR] Could not initialize Gemini model '{GEMINI_MODEL}': {e}")
+            model = None
+
 
 
 async def ask_llm_for_answer(
@@ -144,3 +143,4 @@ async def ask_llm_for_answer(
 
     # 4. Fallback: plain string
     return raw_content
+
