@@ -1,9 +1,7 @@
 fastapi
 uvicorn[standard]
 httpx
-playwright
-xai-sdk
+google-generativeai
 python-dotenv
 pydantic
-pypdf
 pandas

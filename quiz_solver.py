@@ -3,67 +3,130 @@ import asyncio
 import os
 import re
 import json
+import io
+import base64
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import pandas as pd
-from pypdf import PdfReader
-from playwright.async_api import async_playwright
+from urllib.parse import urljoin
 
-from grok_client import ask_grok_for_answer
+from gemini_client import ask_llm_for_answer
 
 HTTP_TIMEOUT = 60  # seconds
 
 
 async def fetch_quiz_page(url: str) -> Tuple[str, str, List[str]]:
     """
-    Use Playwright to render the quiz page (JS-enabled).
-    Returns: (html, visible_text, list_of_links)
+    Fetch the quiz page using plain HTTP (no JS execution).
+    Additionally:
+    - Detect any atob(`...`) or atob("...") calls in <script> tags.
+    - Base64-decode those strings to reconstruct the rendered HTML/text.
+    - Return:
+        html          = original HTML
+        page_text     = plain text from HTML + decoded segments
+        links         = all href links from original HTML + decoded segments
     """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=HTTP_TIMEOUT * 1000)
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        html = r.text
 
-        html = await page.content()
-        # Visible text
+    # --- 1. Decode base64 segments from atob() calls ---
+
+    decoded_segments: List[str] = []
+
+    # Pattern: atob(`....`)
+    for m in re.finditer(r"atob\(\s*`([^`]+)`\s*\)", html, flags=re.DOTALL):
+        b64 = m.group(1).replace("\n", "").replace("\r", "")
         try:
-            text = await page.inner_text("body")
+            decoded = base64.b64decode(b64).decode("utf-8", errors="ignore")
+            decoded_segments.append(decoded)
         except Exception:
-            text = html
+            continue
 
-        # Collect all href links
-        links = await page.eval_on_selector_all(
-            "a",
-            "els => els.map(e => e.href)"
-        )
+    # Pattern: atob("....")
+    for m in re.finditer(r'atob\(\s*"([^"]+)"\s*\)', html, flags=re.DOTALL):
+        b64 = m.group(1).replace("\n", "").replace("\r", "")
+        try:
+            decoded = base64.b64decode(b64).decode("utf-8", errors="ignore")
+            decoded_segments.append(decoded)
+        except Exception:
+            continue
 
-        await browser.close()
+    # --- 2. Plain-text extraction from original HTML (without scripts/styles) ---
 
-    return html, text, links
+    no_script_html = re.sub(
+        r"<script.*?>.*?</script>",
+        " ",
+        html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    no_style_html = re.sub(
+        r"<style.*?>.*?</style>",
+        " ",
+        no_script_html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    plain_html_text = re.sub(r"<[^>]+>", " ", no_style_html)
+    plain_html_text = re.sub(r"\s+", " ", plain_html_text).strip()
+
+    # --- 3. Extract links from original HTML ---
+
+    raw_links = re.findall(r'href=["\']([^"\']+)["\']', html)
+    links = [urljoin(url, link) for link in raw_links]
+
+    # --- 4. Extract links from decoded segments (they usually contain <a href="...">) ---
+
+    for seg in decoded_segments:
+        for link in re.findall(r'href=["\']([^"\']+)["\']', seg):
+            links.append(urljoin(url, link))
+
+    # Deduplicate links
+    links = list(dict.fromkeys(links))
+
+    # --- 5. Combine plain HTML text with decoded segments as page_text ---
+
+    decoded_text = "\n\n".join(
+        re.sub(r"\s+", " ", seg).strip() for seg in decoded_segments
+    )
+
+    if decoded_text:
+        page_text = plain_html_text + "\n\n" + decoded_text
+    else:
+        page_text = plain_html_text
+
+    return html, page_text, links
 
 
 def extract_quiz_instructions(page_text: str) -> str:
     """
-    Heuristic: the question usually appears after something like 'Qxxx.' or 'Question'.
-    For now, we just return the full text; Grok will pick the relevant part.
+    For now, just return the full page_text.
+    Gemini will focus on the relevant question/instructions.
     """
     return page_text
 
 
 def find_submit_url(page_text: str, links: List[str]) -> Optional[str]:
     """
-    Try to find the submit URL from page text or links.
-    Typically it looks like: 'Post your answer to https://example.com/submit ...'.
+    Try to find the submit URL from:
+    - Text like: 'Post your answer to https://example.com/submit ...'
+    - Any URL in text containing 'submit'
+    - Any href link containing 'submit'
     """
-    # 1. Look for 'Post your answer to <url>'
-    m = re.search(r"Post your answer to\s+(https?://[^\s\"']+)", page_text)
+    # 1. Exact pattern: 'Post your answer to <url>'
+    m = re.search(r"Post your answer to\s+(https?://[^\s\"'<>]+)", page_text, flags=re.IGNORECASE)
     if m:
         return m.group(1).strip()
 
-    # 2. Fallback: any link containing 'submit'
+    # 2. Any URL in the text that contains 'submit'
+    m = re.search(r"(https?://[^\s\"'<>]*submit[^\s\"'<>]*)", page_text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # 3. Fallback: any link from hrefs that contains 'submit'
     for link in links:
-        if "submit" in link:
+        if "submit" in link.lower():
             return link
 
     return None
@@ -71,8 +134,15 @@ def find_submit_url(page_text: str, links: List[str]) -> Optional[str]:
 
 async def download_and_extract_file_text(url: str) -> Dict[str, Any]:
     """
-    Download file and convert to text summary for Grok.
-    Supports CSV, JSON, TXT, PDF (basic text extraction).
+    Download file and convert to text summary for the LLM.
+
+    To avoid NotImplementedError / PDF issues, we **do not** try to parse PDFs.
+    - CSV → read with pandas
+    - JSON → pretty-print or raw text
+    - TXT/other → raw text
+    - PDF → just a placeholder message
+
+    This function must **never raise**; on any error it returns a short error message.
     """
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         r = await client.get(url)
@@ -81,27 +151,32 @@ async def download_and_extract_file_text(url: str) -> Dict[str, Any]:
         raw = r.content
 
     text_snippet = ""
-    if url.lower().endswith(".csv") or "text/csv" in content_type:
-        df = pd.read_csv(pd.io.common.BytesIO(raw))
-        text_snippet = df.to_csv(index=False)
-    elif url.lower().endswith(".json") or "application/json" in content_type:
-        try:
-            obj = json.loads(raw)
-            text_snippet = json.dumps(obj, indent=2)
-        except Exception:
-            text_snippet = raw.decode("utf-8", errors="ignore")
-    elif url.lower().endswith(".pdf") or "application/pdf" in content_type:
-        reader = PdfReader(pd.io.common.BytesIO(raw))
-        pages_text = []
-        for i, page in enumerate(reader.pages, start=1):
+    try:
+        lower_url = url.lower()
+
+        # CSV
+        if lower_url.endswith(".csv") or "text/csv" in content_type:
+            df = pd.read_csv(io.BytesIO(raw))
+            text_snippet = df.to_csv(index=False)
+
+        # JSON
+        elif lower_url.endswith(".json") or "application/json" in content_type:
             try:
-                pages_text.append(f"[Page {i}]\n" + page.extract_text())
+                obj = json.loads(raw)
+                text_snippet = json.dumps(obj, indent=2)
             except Exception:
-                continue
-        text_snippet = "\n\n".join(pages_text)
-    else:
-        # Treat as generic text
-        text_snippet = raw.decode("utf-8", errors="ignore")
+                text_snippet = raw.decode("utf-8", errors="ignore")
+
+        # PDF → DO NOT PARSE, just mark it
+        elif lower_url.endswith(".pdf") or "application/pdf" in content_type:
+            text_snippet = "[PDF file linked here; PDF parsing disabled to avoid NotImplementedError.]"
+
+        # Generic text / others
+        else:
+            text_snippet = raw.decode("utf-8", errors="ignore")
+
+    except Exception as e:
+        text_snippet = f"[Error while parsing file: {type(e).__name__}]"
 
     return {
         "url": url,
@@ -137,10 +212,10 @@ async def solve_single_quiz(
 ) -> Dict[str, Any]:
     """
     Solve one quiz URL:
-    - Render page
+    - Render page (via HTTP + base64 decoding)
     - Extract instructions & submit URL
     - Download data files
-    - Ask Grok for 'answer'
+    - Ask Gemini for 'answer'
     - Submit to quiz server
     Returns dict with details, including any next URL.
     """
@@ -153,8 +228,8 @@ async def solve_single_quiz(
 
     data_files = await discover_data_files(links)
 
-    # Ask Grok for answer, using all context
-    answer = await ask_grok_for_answer(
+    # Ask Gemini for answer, using all context
+    answer = await ask_llm_for_answer(
         quiz_url=quiz_url,
         page_text=page_text,
         quiz_instructions=instructions,
