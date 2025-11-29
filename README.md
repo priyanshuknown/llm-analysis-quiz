@@ -1,34 +1,20 @@
-# llm-analysis-quiz
-# TDS Project 2 – LLM Analysis Quiz
+# TDS LLM Analysis Quiz – Grok Implementation
 
-This project implements the API endpoint required for the
-**LLM Analysis Quiz** project in the Tools in Data Science course.
+This FastAPI project implements the IITM TDS *LLM Analysis Quiz* endpoint using:
 
-The endpoint:
-
-- Accepts POST requests with JSON payload containing:
-  - `email`
-  - `secret`
-  - `url` (quiz URL)
-- Validates JSON and secret
-- Loads the quiz page in a headless browser (Playwright)
-- Uses OpenAI to:
-  - Understand the quiz instructions
-  - Identify the submit URL
-  - Construct the answer JSON
-- Submits the answer to the submit URL
-- Returns a JSON response
-
----
+- FastAPI
+- Playwright (headless Chromium) for JS-rendered quiz pages
+- httpx for HTTP calls
+- Grok (xAI API) via `xai-sdk` for reasoning and data analysis
+- pandas + pypdf for basic data file handling
 
 ## 1. Setup
 
-### 1.1 Create and activate a virtual environment (optional)
-
 ```bash
 python -m venv .venv
-# Linux/macOS
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
-# Windows (PowerShell)
-.\.venv\Scripts\activate
+pip install -r requirements.txt
+
+# Install Chromium for Playwright
+playwright install chromium
