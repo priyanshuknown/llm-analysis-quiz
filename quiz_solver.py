@@ -245,12 +245,22 @@ async def solve_single_quiz(
     - Submit to quiz server
     Returns dict with details, including any next URL.
     """
+    from urllib.parse import urlparse, urljoin  # make sure this is imported at top
+
     html, page_text, links = await fetch_quiz_page(quiz_url)
     instructions = extract_quiz_instructions(page_text)
     submit_url = find_submit_url(quiz_url, page_text, links, html)
 
+# If we still couldn't find it, fall back to origin + "/submit"
     if not submit_url:
-        raise RuntimeError(f"Could not find submit URL on quiz page: {quiz_url}")
+        parsed = urlparse(quiz_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        submit_url = urljoin(origin, "/submit")
+
+    # If even that fails somehow (no scheme/netloc), then give up
+        if not parsed.scheme or not parsed.netloc:
+            raise RuntimeError(f"Could not find submit URL on quiz page: {quiz_url}")
+
 
     data_files = await discover_data_files(links)
 
