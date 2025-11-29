@@ -15,6 +15,64 @@ from gemini_client import ask_llm_for_answer
 
 HTTP_TIMEOUT = 60  # seconds
 
+def extract_submission_template(page_text: str) -> Optional[Dict[str, Any]]:
+    """
+    Try to extract a JSON payload template from the quiz page.
+
+    Many quizzes show something like:
+
+      Post your answer to https://.../submit with this JSON payload:
+
+      <pre>
+      {
+        "email": "your email",
+        "secret": "your secret",
+        "url": "https://example.com/quiz-834",
+        "answer": 12345  // the correct answer
+      }
+      </pre>
+
+    We'll:
+      - find a '{ ... }' block that mentions "email" and "secret"
+      - strip JS-style comments
+      - parse as JSON
+    """
+    if not page_text:
+        return None
+
+    # Find a candidate JSON block that contains "email" and "secret"
+    # This is a bit loose but works for these quiz pages.
+    match = re.search(
+        r"\{[^{}]*\"email\"[^{}]*\"secret\"[^{}]*\}",
+        page_text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    raw_block = match.group(0)
+
+    # Remove JS-style comments: // ...
+    cleaned_lines = []
+    for line in raw_block.splitlines():
+        # drop everything after //
+        line = line.split("//", 1)[0]
+        if line.strip():
+            cleaned_lines.append(line)
+    cleaned = "\n".join(cleaned_lines)
+
+    # Sometimes trailing commas can break JSON. Try to fix a few common cases.
+    cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
+
+    try:
+        template = json.loads(cleaned)
+        if isinstance(template, dict):
+            return template
+    except Exception:
+        return None
+
+    return None
+
 
 async def fetch_quiz_page(url: str) -> Tuple[str, str, List[str]]:
     """
@@ -272,13 +330,29 @@ async def solve_single_quiz(
         data_files=data_files,
     )
 
-    # Build payload to submit
+# Try to extract a JSON template from the quiz page
+template = extract_submission_template(page_text)
+
+if template:
+    # Start from template and overwrite key fields
+    submit_payload = dict(template)  # shallow copy
+
+    # Overwrite with our real values
+    submit_payload["email"] = student_email
+    submit_payload["secret"] = student_secret
+    submit_payload["url"] = quiz_url
+    submit_payload["answer"] = answer
+else:
+    # Fallback to our generic payload if no template found
     submit_payload = {
         "email": student_email,
         "secret": student_secret,
         "url": quiz_url,
         "answer": answer,
     }
+
+submit_resp = await client.post(submit_url, json=submit_payload)
+submit_resp.raise_for_status()
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         resp = await client.post(submit_url, json=submit_payload)
