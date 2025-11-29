@@ -1,189 +1,219 @@
 # quiz_solver.py
+import asyncio
+import os
+import re
 import json
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 
-import requests
-from playwright.sync_api import sync_playwright
-from openai import OpenAI
+import httpx
+import pandas as pd
+from pypdf import PdfReader
+from playwright.async_api import async_playwright
 
-from config import OPENAI_API_KEY
+from grok_client import ask_grok_for_answer
+
+HTTP_TIMEOUT = 60  # seconds
 
 
-# OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-
-def load_quiz_page(quiz_url: str) -> dict:
+async def fetch_quiz_page(url: str) -> Tuple[str, str, List[str]]:
     """
-    Load quiz page in a headless Chromium browser so that
-    JavaScript runs and DOM is fully rendered.
+    Use Playwright to render the quiz page (JS-enabled).
+    Returns: (html, visible_text, list_of_links)
     """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        # Wait for network idle, in case the quiz fetches extra data
-        page.goto(quiz_url, wait_until="networkidle", timeout=120_000)
-        body_text = page.inner_text("body")
-        full_html = page.content()
-        browser.close()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.goto(url, wait_until="networkidle", timeout=HTTP_TIMEOUT * 1000)
 
-    return {"text": body_text, "html": full_html}
+        html = await page.content()
+        # Visible text
+        try:
+            text = await page.inner_text("body")
+        except Exception:
+            text = html
+
+        # Collect all href links
+        links = await page.eval_on_selector_all(
+            "a",
+            "els => els.map(e => e.href)"
+        )
+
+        await browser.close()
+
+    return html, text, links
 
 
-def ask_llm_for_plan(
-    quiz_url: str,
-    email: str,
-    secret: str,
-    quiz_page: dict,
-    original_payload: dict,
-) -> Dict[str, Any]:
+def extract_quiz_instructions(page_text: str) -> str:
     """
-    Use OpenAI to:
-    - Understand quiz instructions
-    - Identify submit URL
-    - Build JSON payload to send to submit URL
-
-    We force a JSON response using response_format={"type": "json_object"}.
+    Heuristic: the question usually appears after something like 'Qxxx.' or 'Question'.
+    For now, we just return the full text; Grok will pick the relevant part.
     """
-
-    system_message = (
-        "You are a careful assistant that solves data quizzes and returns JSON only. "
-        "You must read the quiz page, understand the instructions, and build a JSON "
-        "object describing how to submit the answer."
-    )
-
-    user_instructions = """
-You are given:
-1. The URL where the quiz page is hosted.
-2. The rendered text and HTML of the page.
-3. The student's email and secret (used for authentication).
-
-TASK:
-
-1. Read the quiz instructions in the page.
-2. Identify the exact URL where the answer must be submitted (submit_url).
-   - This is often written like: "Post your answer to https://example.com/submit".
-3. Figure out what the "answer" should be conceptually.
-   - Do NOT download files yourself in this step; just reason about what needs to be done.
-   - The surrounding Python code will handle downloads/computations where needed.
-4. Build the JSON payload that must be sent to the submit URL.
-   - Always include: "email", "secret", and "url" (the original quiz URL).
-   - Add an "answer" field (or whatever the quiz demands) with the correct type:
-       * number / string / boolean / base64 URI / nested JSON, etc.
-   - Keep payload size under 1MB.
-
-Return JSON in this exact schema:
-
-{
-  "reasoning_summary": "short explanation of what the quiz asked and how you solved it",
-  "submit_url": "https://....",
-  "answer_payload": {
-      "email": "...",
-      "secret": "...",
-      "url": "https://quiz-url",
-      "answer": <value or object as required by the quiz>
-      // you may add more keys if quiz requires them
-  }
-}
-
-IMPORTANT RULES:
-- Output MUST be valid JSON.
-- Do NOT include comments or trailing commas.
-- Do NOT add extra top-level keys.
-"""
-
-    # Context object with quiz details
-    user_content = {
-        "quiz_url": quiz_url,
-        "student_email": email,
-        "student_secret": secret,
-        "original_payload": original_payload,
-        "quiz_page_text": quiz_page["text"],
-        "quiz_page_html": quiz_page["html"],
-    }
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_message},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": user_instructions,
-                    },
-                    {
-                        "type": "text",
-                        "text": json.dumps(user_content)[:30000],  # safety limit
-                    },
-                ],
-            },
-        ],
-    )
-
-    content = response.choices[0].message.content
-    plan = json.loads(content)
-    return plan
+    return page_text
 
 
-def submit_answer(plan: Dict[str, Any]) -> Dict[str, Any]:
+def find_submit_url(page_text: str, links: List[str]) -> Optional[str]:
     """
-    Send answer_payload to submit_url.
-    Return JSON from submit endpoint plus what was sent.
+    Try to find the submit URL from page text or links.
+    Typically it looks like: 'Post your answer to https://example.com/submit ...'.
     """
-    submit_url = plan["submit_url"]
-    answer_payload = plan["answer_payload"]
+    # 1. Look for 'Post your answer to <url>'
+    m = re.search(r"Post your answer to\s+(https?://[^\s\"']+)", page_text)
+    if m:
+        return m.group(1).strip()
 
-    if not isinstance(submit_url, str) or not submit_url.startswith("http"):
-        raise ValueError(f"submit_url looks invalid: {submit_url}")
+    # 2. Fallback: any link containing 'submit'
+    for link in links:
+        if "submit" in link:
+            return link
 
-    resp = requests.post(submit_url, json=answer_payload, timeout=120)
-    resp.raise_for_status()
+    return None
 
-    try:
-        resp_json = resp.json()
-    except Exception:
-        resp_json = {"raw_text": resp.text}
+
+async def download_and_extract_file_text(url: str) -> Dict[str, Any]:
+    """
+    Download file and convert to text summary for Grok.
+    Supports CSV, JSON, TXT, PDF (basic text extraction).
+    """
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        content_type = r.headers.get("content-type", "")
+        raw = r.content
+
+    text_snippet = ""
+    if url.lower().endswith(".csv") or "text/csv" in content_type:
+        df = pd.read_csv(pd.io.common.BytesIO(raw))
+        text_snippet = df.to_csv(index=False)
+    elif url.lower().endswith(".json") or "application/json" in content_type:
+        try:
+            obj = json.loads(raw)
+            text_snippet = json.dumps(obj, indent=2)
+        except Exception:
+            text_snippet = raw.decode("utf-8", errors="ignore")
+    elif url.lower().endswith(".pdf") or "application/pdf" in content_type:
+        reader = PdfReader(pd.io.common.BytesIO(raw))
+        pages_text = []
+        for i, page in enumerate(reader.pages, start=1):
+            try:
+                pages_text.append(f"[Page {i}]\n" + page.extract_text())
+            except Exception:
+                continue
+        text_snippet = "\n\n".join(pages_text)
+    else:
+        # Treat as generic text
+        text_snippet = raw.decode("utf-8", errors="ignore")
 
     return {
-        "submit_url": submit_url,
-        "answer_payload": answer_payload,
-        "quiz_response": resp_json,
+        "url": url,
+        "content_type": content_type,
+        "text_snippet": text_snippet,
     }
 
 
-def solve_quiz(
+async def discover_data_files(links: List[str]) -> List[Dict[str, Any]]:
+    """
+    From all page links, pick those that look like data files (csv/json/pdf/txt)
+    and download them.
+    """
+    data_links = [
+        link for link in links
+        if any(
+            link.lower().endswith(ext)
+            for ext in (".csv", ".json", ".txt", ".pdf")
+        )
+    ]
+
+    tasks = [download_and_extract_file_text(l) for l in data_links]
+    if not tasks:
+        return []
+
+    return await asyncio.gather(*tasks)
+
+
+async def solve_single_quiz(
     quiz_url: str,
-    incoming_payload: dict,
-    email: str,
-    secret: str,
+    student_email: str,
+    student_secret: str,
 ) -> Dict[str, Any]:
     """
-    High-level orchestration:
-
-    1. Load quiz page via Playwright (JS executes).
-    2. Ask LLM to understand instructions and build a plan.
-    3. Submit the answer to the instructed submit URL.
-    4. Return final JSON that will be sent back to TDS evaluator.
+    Solve one quiz URL:
+    - Render page
+    - Extract instructions & submit URL
+    - Download data files
+    - Ask Grok for 'answer'
+    - Submit to quiz server
+    Returns dict with details, including any next URL.
     """
-    quiz_page = load_quiz_page(quiz_url)
+    html, page_text, links = await fetch_quiz_page(quiz_url)
+    instructions = extract_quiz_instructions(page_text)
+    submit_url = find_submit_url(page_text, links)
 
-    plan = ask_llm_for_plan(
+    if not submit_url:
+        raise RuntimeError(f"Could not find submit URL on quiz page: {quiz_url}")
+
+    data_files = await discover_data_files(links)
+
+    # Ask Grok for answer, using all context
+    answer = await ask_grok_for_answer(
         quiz_url=quiz_url,
-        email=email,
-        secret=secret,
-        quiz_page=quiz_page,
-        original_payload=incoming_payload,
+        page_text=page_text,
+        quiz_instructions=instructions,
+        data_files=data_files,
     )
 
-    submission_result = submit_answer(plan)
+    # Build payload to submit
+    submit_payload = {
+        "email": student_email,
+        "secret": student_secret,
+        "url": quiz_url,
+        "answer": answer,
+    }
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        resp = await client.post(submit_url, json=submit_payload)
+        resp.raise_for_status()
+        resp_json = resp.json()
+
+    # Next URL if any
+    next_url = resp_json.get("url")
 
     return {
         "quiz_url": quiz_url,
-        "llm_reasoning_summary": plan.get("reasoning_summary"),
-        "submit_url": submission_result["submit_url"],
-        "answer_payload": submission_result["answer_payload"],
-        "quiz_response": submission_result["quiz_response"],
+        "submit_url": submit_url,
+        "answer": answer,
+        "submit_response": resp_json,
+        "next_url": next_url,
+    }
+
+
+async def run_quiz_chain(
+    start_url: str,
+    student_email: str,
+    student_secret: str,
+    max_steps: int = 5,
+) -> Dict[str, Any]:
+    """
+    Repeatedly solve quizzes starting from start_url
+    until there's no new url or we hit max_steps.
+    """
+    results: List[Dict[str, Any]] = []
+    current_url = start_url
+
+    for step in range(1, max_steps + 1):
+        step_result = await solve_single_quiz(
+            quiz_url=current_url,
+            student_email=student_email,
+            student_secret=student_secret,
+        )
+        results.append(step_result)
+
+        next_url = step_result.get("next_url")
+        if not next_url:
+            break
+        current_url = next_url
+
+    return {
+        "start_url": start_url,
+        "steps_taken": len(results),
+        "results": results,
     }
