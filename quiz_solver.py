@@ -331,28 +331,28 @@ async def solve_single_quiz(
     )
 
 # Try to extract a JSON template from the quiz page
-template = extract_submission_template(page_text)
+    template = extract_submission_template(page_text)
 
-if template:
+    if template:
     # Start from template and overwrite key fields
-    submit_payload = dict(template)  # shallow copy
+        submit_payload = dict(template)  # shallow copy
 
     # Overwrite with our real values
-    submit_payload["email"] = student_email
-    submit_payload["secret"] = student_secret
-    submit_payload["url"] = quiz_url
-    submit_payload["answer"] = answer
-else:
+        submit_payload["email"] = student_email
+        submit_payload["secret"] = student_secret
+        submit_payload["url"] = quiz_url
+        submit_payload["answer"] = answer
+    else:
     # Fallback to our generic payload if no template found
-    submit_payload = {
-        "email": student_email,
-        "secret": student_secret,
-        "url": quiz_url,
-        "answer": answer,
-    }
+        submit_payload = {
+            "email": student_email,
+            "secret": student_secret,
+            "url": quiz_url,
+            "answer": answer,
+        }
 
-submit_resp = await client.post(submit_url, json=submit_payload)
-submit_resp.raise_for_status()
+    submit_resp = await client.post(submit_url, json=submit_payload)
+    submit_resp.raise_for_status()
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         resp = await client.post(submit_url, json=submit_payload)
@@ -361,7 +361,6 @@ submit_resp.raise_for_status()
 
     # Next URL if any
     next_url = resp_json.get("url")
-
     return {
         "quiz_url": quiz_url,
         "submit_url": submit_url,
